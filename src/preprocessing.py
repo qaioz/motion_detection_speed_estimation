@@ -2,13 +2,15 @@ import cv2
 import numpy as np
 from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import StandardScaler
+import cupy as cp
+from cv2 import cuda
 
 # bg_subtractor = cv2.createBackgroundSubtractorMOG2()
 
 
 def convert_to_grayscale(frame: np.ndarray, use_builtin: bool = False) -> np.ndarray:
     """
-    Convert an RGB frame to grayscale.
+    Convert an RGB frame to grayscale using GPU acceleration.
     Parameters:
     - frame: np.ndarray, input frame in RGB format.
     - use_builtin: bool, whether to use OpenCV's built-in function for conversion.
@@ -17,17 +19,27 @@ def convert_to_grayscale(frame: np.ndarray, use_builtin: bool = False) -> np.nda
     """
     
     if use_builtin:
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Convert to GPU
+        gpu_frame = cuda.GpuMat()
+        gpu_frame.upload(frame)
+        
+        # Convert to grayscale on GPU
+        gpu_gray = cuda.GpuMat()
+        cuda.cvtColor(gpu_frame, gpu_gray, cv2.COLOR_BGR2GRAY)
+        
+        # Download result
+        return gpu_gray.download()
     
-    # BGR weights (reversed from RGB weights)
-    weights = np.array([0.1140, 0.5870, 0.2989])
-    grayscale = np.dot(frame[..., :3], weights)
-    return np.uint8(grayscale)
+    # Custom implementation using cupy
+    weights = cp.array([0.1140, 0.5870, 0.2989])
+    frame_gpu = cp.asarray(frame[..., :3])
+    grayscale = cp.dot(frame_gpu, weights)
+    return cp.asnumpy(grayscale).astype(np.uint8)
 
 
 def apply_kernel(frame: np.ndarray, kernel: np.ndarray, use_builtin: bool = True, shadow_threshold: int = 250) -> np.ndarray:
     """
-    Apply a 2D convolution kernel to a frame from scratch.
+    Apply a 2D convolution kernel to a frame from scratch using GPU acceleration.
     
     Parameters:
     - frame: np.ndarray, input frame, already converted to grayscale.
@@ -39,10 +51,23 @@ def apply_kernel(frame: np.ndarray, kernel: np.ndarray, use_builtin: bool = True
     - np.ndarray, frame with the kernel applied.
     """
     if use_builtin:
-        filtered = cv2.filter2D(frame, -1, kernel)
-        # Apply shadow thresholding
+        # Convert inputs to GPU
+        gpu_frame = cuda.GpuMat()
+        gpu_frame.upload(frame)
+        gpu_kernel = cv2.cuda_Filter2D(cv2.CV_8UC1, kernel)
+        
+        # Apply filter on GPU
+        gpu_filtered = cuda.GpuMat()
+        gpu_kernel.apply(gpu_frame, gpu_filtered)
+        
+        # Download and apply threshold
+        filtered = gpu_filtered.download()
         filtered[filtered < shadow_threshold] = 0
         return filtered
+    
+    # Custom implementation using cupy
+    frame_gpu = cp.asarray(frame)
+    kernel_gpu = cp.asarray(kernel)
     
     # Get dimensions
     frame_height, frame_width = frame.shape
@@ -76,7 +101,7 @@ def apply_kernel(frame: np.ndarray, kernel: np.ndarray, use_builtin: bool = True
 
 def process_video(input_path: str, filter_type: str, output_path: str = None, display: bool = True) -> None:
     """
-    Process a video with a specified filter.
+    Process a video with a specified filter using GPU acceleration.
     
     Parameters:
     - input_path: str, path to input video file
@@ -87,17 +112,25 @@ def process_video(input_path: str, filter_type: str, output_path: str = None, di
     Returns:
     - None
     """
+    # Check if CUDA is available
+    if not cuda.getCudaEnabledDeviceCount():
+        print("WARNING: CUDA is not available. Falling back to CPU processing.")
+        return
+    
+    # Create GPU stream
+    stream = cuda.Stream()
+    
     # Define filter kernels
     kernels = {
-        'blur': np.array([[1, 2, 1],
+        'blur': cp.array([[1, 2, 1],
                          [2, 4, 2],
                          [1, 2, 1]]) / 16.0,
-        'edge': np.array([[-1, -2, 0, 2, 1],
+        'edge': cp.array([[-1, -2, 0, 2, 1],
                          [-4, -8, 0, 8, 4],
                          [-6, -12, 0, 12, 6],
                          [-4, -8, 0, 8, 4],
                          [-1, -2, 0, 2, 1]]),
-        'sharpen': np.array([[0, -1, 0],
+        'sharpen': cp.array([[0, -1, 0],
                             [-1, 5, -1],
                             [0, -1, 0]])
     }
@@ -129,19 +162,34 @@ def process_video(input_path: str, filter_type: str, output_path: str = None, di
     prev_gray = convert_to_grayscale(prev_frame)
     
     current_frame = 0
+    print(f"Starting video processing. Total frames: {total_frames}")
+    
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
         
-        # Convert current frame to grayscale
-        gray_frame = convert_to_grayscale(frame)
+        # Upload frame to GPU
+        gpu_frame = cuda.GpuMat()
+        gpu_frame.upload(frame)
         
-        # Calculate frame difference
-        frame_diff = cv2.absdiff(gray_frame, prev_gray)
+        # Process on GPU
+        gray_frame = convert_to_grayscale(frame, use_builtin=True)
         
-        # Threshold the difference to get significant changes
-        _, motion_mask = cv2.threshold(frame_diff, 30, 255, cv2.THRESH_BINARY)
+        # Frame difference on GPU
+        gpu_gray = cuda.GpuMat()
+        gpu_prev = cuda.GpuMat()
+        gpu_gray.upload(gray_frame)
+        gpu_prev.upload(prev_gray)
+        gpu_diff = cuda.GpuMat()
+        cuda.absdiff(gpu_gray, gpu_prev, gpu_diff)
+        
+        # Threshold on GPU
+        gpu_motion = cuda.GpuMat()
+        cuda.threshold(gpu_diff, gpu_motion, 30, 255, cv2.THRESH_BINARY)
+        
+        # Download results for CPU operations
+        motion_mask = gpu_motion.download()
         
         # Apply the original filter
         filtered_frame = apply_kernel(gray_frame, kernels[filter_type])
@@ -214,6 +262,8 @@ def process_video(input_path: str, filter_type: str, output_path: str = None, di
         prev_gray = gray_frame
         current_frame += 1
     
+    print(f"Completed processing {current_frame} frames")
+    
     # Cleanup
     cap.release()
     if out:
@@ -228,6 +278,7 @@ if __name__ == "__main__":
     process_video(
         input_path='./data/jump_one_slowed.mp4',
         filter_type='edge',
-        output_path='./results/edge.mp4'
+        output_path='./results/edge.mp4',
+        display=False
     )
 
